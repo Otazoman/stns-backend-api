@@ -1,0 +1,401 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "IAM roles, DynamoDB tables, and API Gateway for stns backend API with groups and users endpoints."
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+    Description: Name of API stage.
+
+Resources:
+# ------------------------------------------------------------#
+# IAM Role
+# ------------------------------------------------------------#
+  # IAM role for DynamoDB access
+  StnsDynamoDBOSuserRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: stns-backend-iam-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+
+  # IAM role policy for DynamoDB access
+  StnsDynamoDBOSuserRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: stns-backend-iam-policy
+      Roles: [ !Ref StnsDynamoDBOSuserRole ]  # Reference the role
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:Query
+              - dynamodb:Scan
+            Resource: "*"
+
+  # IAM instance profile with the IAM role
+  DynamoDBOsuserInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [ !Ref StnsDynamoDBOSuserRole ]  # Reference the role
+  
+  # CloudwatchLogs
+  ApigCloudWatchLogsInvocationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ApigCloudWatchLogsInvocationRole-${AWS::AccountId}
+      Description: This role allows all API Gateways to invoke CloudWatch Logs.
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  ApigAccountSettingCloudWatchLogs:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApigCloudWatchLogsInvocationRole.Arn
+    DependsOn:
+      - ApigCloudWatchLogsInvocationRole
+      
+# ------------------------------------------------------------#
+# DynamoDB
+# ------------------------------------------------------------#
+  # DynamoDB Table for OS users
+  DynamoOsUserTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: stns-osuser
+      AttributeDefinitions:
+        - AttributeName: name
+          AttributeType: S
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: name
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: id-Index
+          KeySchema:
+            - AttributeName: id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+          
+  # DynamoDB Table for OS groups
+  DynamoOsGroupTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: stns-osgroup
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+# ------------------------------------------------------------#
+# APIGateway
+# ------------------------------------------------------------#
+  # API Gateway for stns API
+  StnsBackendApi:
+    Type: AWS::ApiGateway::RestApi
+    DependsOn:
+      - StnsDynamoDBOSuserRole
+      - DynamoOsGroupTable
+      - DynamoOsUserTable
+    Properties:
+      Name: stns-backend-api
+      Description: stns backend api
+
+  GroupsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref StnsBackendApi
+      ParentId: !GetAtt StnsBackendApi.RootResourceId
+      PathPart: "groups"
+
+  UsersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref StnsBackendApi
+      ParentId: !GetAtt StnsBackendApi.RootResourceId
+      PathPart: "users"
+
+  GetGroupsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: GET
+      ResourceId: !Ref GroupsResource
+      RestApiId: !Ref StnsBackendApi
+      ApiKeyRequired: true
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub  "arn:aws:apigateway:${AWS::Region}:dynamodb:action/DynamoDB_20120810.Scan"
+        Credentials: !GetAtt StnsDynamoDBOSuserRole.Arn
+        RequestParameters:
+          integration.request.header.X-Amz-Target: "'DynamoDB_20120810.Scan'"
+        RequestTemplates:
+          application/json: !Sub |
+              #set($inputRoot = $input.json('$'))
+              #set($id = $input.params('id'))
+              #set($name = $input.params('name'))
+              #set($querystring = $input.params().get('querystring'))
+
+              #if($querystring =="{}")
+                #set($context.requestOverride.header['X-Amz-Target'] = 'DynamoDB_20120810.Scan')
+                {
+                    "TableName": "${DynamoOsGroupTable}"
+                }
+              #elseif($id && $id != "")
+                #set($context.requestOverride.header['X-Amz-Target'] = 'DynamoDB_20120810.GetItem')
+                {
+                    "TableName": "${DynamoOsGroupTable}",
+                    "Key": {
+                        "id": {
+                            "S": "$id"
+                        }
+                    }
+                }
+              #elseif($name && $name != "")
+                #set($context.requestOverride.header['X-Amz-Target'] = 'DynamoDB_20120810.Scan')
+                {    
+                    "TableName": "${DynamoOsGroupTable}",
+                    "ExpressionAttributeNames": {
+                        "#name": "name"
+                    },
+                    "FilterExpression": "#name = :name",
+                    "ExpressionAttributeValues": {
+                        ":name": {
+                            "S": "$name"
+                        }
+                    }
+                }
+              #else
+                #set($context.responseOverride.status = 400)
+                {
+                    "message": "Invalid parameters"
+                }
+              #end
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: |
+                  #set($inputRoot = $input.path('$'))
+
+                  #if($inputRoot == "{}" || $inputRoot.Count == 0 )
+                    #set($context.responseOverride.status = 404)
+                    {
+                       "message": "No data found"
+                    }
+                  #elseif($inputRoot.Items.size() > 0)
+                  [
+                  #foreach($elem in $inputRoot.Items)
+                    {
+                      "id": $elem.id.S,
+                      "name": "$elem.name.S",
+                      "users": [#foreach($user in $elem.users.L)"$user.S"#if($foreach.hasNext),#end#end],
+                      "link_groups": [#foreach($group in $elem.groups.L)"$group.S"#if($foreach.hasNext),#end#end]
+                    }
+                    #if($foreach.hasNext),#end
+                  #end
+                  ]
+                  #elseif($inputRoot.Item.size() > 0)
+                  [
+                    {
+                      "id": $inputRoot.Item.id.S,
+                      "name": "$inputRoot.Item.name.S",
+                      "users": [#foreach($user in $inputRoot.Item.users.L)"$user.S"#if($foreach.hasNext),#end#end],
+                      "link_groups": [#foreach($group in $inputRoot.Item.link_groups.L)   "$group.S"#if($foreach.hasNext),#end#end]
+                    }
+                  ]
+                  #else
+                    #set($context.responseOverride.status = 500)
+                    {
+                      "error": "$inputRoot.errorMessage"
+                    }
+                  #end
+      MethodResponses:
+        - StatusCode: 200
+        - StatusCode: 400
+        - StatusCode: 404
+        - StatusCode: 500
+
+  GetUsersMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: GET
+      ResourceId: !Ref UsersResource
+      RestApiId: !Ref StnsBackendApi
+      ApiKeyRequired: true
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:dynamodb:action/DynamoDB_20120810.Scan"
+        Credentials: !GetAtt StnsDynamoDBOSuserRole.Arn
+        RequestParameters:
+          integration.request.header.X-Amz-Target: "'DynamoDB_20120810.Scan'"
+        RequestTemplates:
+          application/json: !Sub |
+              #set($inputRoot = $input.json('$'))
+              #set($id = $input.params('id'))
+              #set($name = $input.params('name'))
+              #set($querystring = $input.params().get('querystring'))
+
+              #if($querystring=="{}")
+                #set($context.requestOverride.header['X-Amz-Target'] = 'DynamoDB_20120810.Scan')
+                {
+                    "TableName": "${DynamoOsUserTable}"
+                }
+              #elseif($name && $name != "")
+                #set($context.requestOverride.header['X-Amz-Target'] = 'DynamoDB_20120810.GetItem')
+                {
+                    "TableName": "${DynamoOsUserTable}",
+                    "Key": {
+                        "name": {
+                            "S": "$name"
+                        }
+                    }
+                }
+              #elseif( $id && $id != "")
+                #set($context.requestOverride.header['X-Amz-Target'] = 'DynamoDB_20120810.Scan')
+                {
+                    "TableName": "${DynamoOsUserTable}",
+                    "FilterExpression": "contains(#id, :id)",
+                    "ExpressionAttributeNames": {
+                        "#id": "id"
+                    },
+                    "ExpressionAttributeValues": {
+                        ":id": {
+                            "S": "$id"
+                        }
+                    }
+                }
+              #else
+                #set($context.responseOverride.status = 400)
+                {
+                    "message": "Invalid parameters"
+                }
+              #end
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: |
+                  #set($inputRoot = $input.path('$'))
+
+                  #if($inputRoot == "{}" || $inputRoot.Count == 0 )
+                    #set($context.responseOverride.status = 404)
+                    {
+                       "message": "No data found"
+                    }
+                  #elseif($inputRoot.Items.size() > 0)
+                  [
+                    #foreach($elem in $inputRoot.Items)
+                      {
+                        "name": "$elem.name.S",
+                        "id": $elem.id.S,
+                        "group_id": $elem.group_id.S,
+                        "shell": "$elem.shell.S",
+                        "directory": "$elem.directory.S",
+                        "keys": [#foreach($key in $elem.keys.L)"$key.S"#if($foreach.hasNext),#end#end],
+                        "link_users": [#foreach($link_user in $elem.link_users.L)"$link_user.S"#if($foreach.hasNext),#end#end],
+                        "password": "$elem.password.S",
+                        "gecos": "$elem.gecos.S"
+                      }
+                    #if($foreach.hasNext),#end
+                    #end
+                  ]
+                  #elseif($inputRoot.Item.size() > 0)
+                  [
+                    {
+                      "name": "$inputRoot.Item.name.S",
+                      "id": $inputRoot.Item.id.S,
+                      "group_id": $inputRoot.Item.group_id.S,
+                      "shell": "$inputRoot.Item.shell.S",
+                      "directory": "$inputRoot.Item.directory.S",
+                      "keys": [#foreach($key in $inputRoot.Item.keys.L)"$key.S"#if($foreach.hasNext),#end#end],
+                      "link_users": [#foreach($link_user in $inputRoot.Item.link_users.L)"$link_user.S"#if($foreach.hasNext),#end#end],
+                      "password": "$inputRoot.Item.password.S",
+                      "gecos": "$inputRoot.Item.gecos.S"
+                    }
+                  ]
+                  #else
+                    #set($context.responseOverride.status = 500)
+                    {
+                      "error": "$inputRoot.errorMessage"
+                    }
+                  #end
+      MethodResponses:
+        - StatusCode: 200
+        - StatusCode: 400
+        - StatusCode: 404
+        - StatusCode: 500
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GetGroupsMethod
+      - GetUsersMethod
+    Properties:
+      RestApiId: !Ref StnsBackendApi
+      StageName: !Ref StageName
+
+  # Create APIKey
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn:
+      - StnsBackendApi
+      - ApiDeployment
+    Properties:
+      Description: Usage plan stns
+      UsagePlanName: stns-api-usage-plan
+      ApiStages:
+        - ApiId: !Ref StnsBackendApi
+          Stage: !Ref StageName
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn:
+      - StnsBackendApi
+      - ApiDeployment
+    Properties:
+      Name: !Sub stns-api-key
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref StnsBackendApi
+          StageName: !Ref StageName
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    DependsOn:
+      - StnsBackendApi
+      - ApiDeployment
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+Outputs:
+  ApiURL:
+    Description: "API Gateway endpoint URL for Prod stage"
+    Value: !Sub 'https://${StnsBackendApi}.execute-api.\${AWS::Region}.amazonaws.com/${StageName}/'
+
