@@ -1,11 +1,22 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: "IAM roles, DynamoDB tables, and API Gateway for stns backend API with groups and users endpoints."
 
+# ------------------------------------------------------------#
+# Parameter
+# ------------------------------------------------------------#
 Parameters:
   StageName:
     Type: String
     Default: prod
     Description: Name of API stage.
+
+  LambdaFunctionName:
+    Type: String
+    Default: stns-auth
+
+  IAMRoleforLambda:
+    Type: String
+    Default: stns-auth-role
 
 Resources:
 # ------------------------------------------------------------#
@@ -111,6 +122,88 @@ Resources:
       BillingMode: PAY_PER_REQUEST
 
 # ------------------------------------------------------------#
+# Lambda
+# ------------------------------------------------------------#
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref IAMRoleforLambda
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: putlog-cloudwatchlogs
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LambdaFunctionName}:*" 
+        - PolicyName: ssm-gettoken
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - 'ssm:GetParameter'
+                Resource: "arn:aws:ssm:*:*:parameter/stns/parameter/token" 
+              - Effect: Allow
+                Action: 
+                  - 'kms:Decrypt'
+                Resource: "arn:aws:kms:*:*:key/22f91baa-55bb-4ba9-99bb-a3927efecabd"
+  TargetFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Role: !GetAtt FunctionRole.Arn
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+
+          ssm = boto3.client('ssm')
+
+          def lambda_handler(event, context):
+              token = event['authorizationToken'].split(' ')[1]
+              if validate_token(token):
+                  return generate_policy('user', 'Allow', event['methodArn'])
+              else:
+                  raise Exception('Unauthorized')
+
+          def validate_token(token):
+              try:
+                  parameter = ssm.get_parameter(Name='/stns/parameter/token', WithDecryption=True)
+                  stored_token = parameter['Parameter']['Value']
+                  
+                  return token == stored_token
+              except Exception as e:
+                  print(f"Error retrieving parameter: {str(e)}")
+                  return False
+
+          def generate_policy(principal_id, effect, resource):
+              return {
+                  'principalId': principal_id,
+                  'policyDocument': {
+                      'Version': '2012-10-17',
+                      'Statement': [{
+                          'Action': 'execute-api:Invoke',
+                          'Effect': effect,
+                          'Resource': resource
+                      }]
+                  }
+              }
+
+# ------------------------------------------------------------#
 # APIGateway
 # ------------------------------------------------------------#
   # API Gateway for stns API
@@ -120,6 +213,7 @@ Resources:
       - StnsDynamoDBOSuserRole
       - DynamoOsGroupTable
       - DynamoOsUserTable
+      - TargetFunction
     Properties:
       Name: stns-backend-api
       Description: stns backend api
@@ -138,14 +232,36 @@ Resources:
       ParentId: !GetAtt StnsBackendApi.RootResourceId
       PathPart: "users"
 
+  # Lambda Authorizer
+  TokenAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: stns-token-authorizer
+      RestApiId: !Ref StnsBackendApi
+      Type: TOKEN
+      AuthorizerUri: !Sub 
+        - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TargetFunction.Arn}/invocations"
+        - LambdaArn: !GetAtt TargetFunction.Arn
+      IdentitySource: method.request.header.Authorization
+      AuthorizerResultTtlInSeconds: 0
+      IdentityValidationExpression: "^token (.*)$"
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt TargetFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${StnsBackendApi}/authorizers/${TokenAuthorizer}"
+
   GetGroupsMethod:
     Type: AWS::ApiGateway::Method
     Properties:
       HttpMethod: GET
       ResourceId: !Ref GroupsResource
       RestApiId: !Ref StnsBackendApi
-      ApiKeyRequired: true
-      AuthorizationType: NONE
+      AuthorizerId: !Ref TokenAuthorizer
+      AuthorizationType: CUSTOM
       Integration:
         Type: AWS
         IntegrationHttpMethod: POST
@@ -245,8 +361,8 @@ Resources:
       HttpMethod: GET
       ResourceId: !Ref UsersResource
       RestApiId: !Ref StnsBackendApi
-      ApiKeyRequired: true
-      AuthorizationType: NONE
+      AuthorizerId: !Ref TokenAuthorizer
+      AuthorizationType: CUSTOM
       Integration:
         Type: AWS
         IntegrationHttpMethod: POST
@@ -358,44 +474,14 @@ Resources:
     Properties:
       RestApiId: !Ref StnsBackendApi
       StageName: !Ref StageName
-
-  # Create APIKey
-  UsagePlan:
-    Type: AWS::ApiGateway::UsagePlan
-    DependsOn:
-      - StnsBackendApi
-      - ApiDeployment
-    Properties:
-      Description: Usage plan stns
-      UsagePlanName: stns-api-usage-plan
-      ApiStages:
-        - ApiId: !Ref StnsBackendApi
-          Stage: !Ref StageName
-
-  ApiKey:
-    Type: AWS::ApiGateway::ApiKey
-    DependsOn:
-      - StnsBackendApi
-      - ApiDeployment
-    Properties:
-      Name: !Sub stns-api-key
-      Enabled: true
-      StageKeys:
-        - RestApiId: !Ref StnsBackendApi
-          StageName: !Ref StageName
-
-  UsagePlanKey:
-    Type: AWS::ApiGateway::UsagePlanKey
-    DependsOn:
-      - StnsBackendApi
-      - ApiDeployment
-    Properties:
-      KeyId: !Ref ApiKey
-      KeyType: API_KEY
-      UsagePlanId: !Ref UsagePlan
+      StageDescription:
+        MethodSettings:
+          - ResourcePath: '/*'
+            HttpMethod: '*'
+            DataTraceEnabled: True
+            LoggingLevel: INFO
 
 Outputs:
   ApiURL:
     Description: "API Gateway endpoint URL for Prod stage"
     Value: !Sub 'https://${StnsBackendApi}.execute-api.\${AWS::Region}.amazonaws.com/${StageName}/'
-
