@@ -1,22 +1,57 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: "IAM roles, DynamoDB tables, and API Gateway for stns backend API with groups and users endpoints."
 
-# ------------------------------------------------------------#
-# Parameter
-# ------------------------------------------------------------#
 Parameters:
+# ------------------------------------------------------------#
+# Parameters
+# ------------------------------------------------------------#
+  # IAM name
+  IAMRoleName:
+    Type: String
+    Default: stns-backend-iam-role
+  IAMPolicyName:
+    Type: String
+    Default: stns-backend-iam-policy
+
+  # DynamoDB Tablename
+  DynamoUserTablename:
+    Type: String
+    Default: stns-osuser
+  DynamoGroupTablename:
+    Type: String
+    Default: stns-osgroup
+
+  # Lambda name and ssm param
+  LambdaFunctionName:
+    Type: String
+    Default: stns-auth
+  IAMRoleforLambda:
+    Type: String
+    Default: stns-lambda-auth-role
+  IAMPolicyforLambda:
+    Type: String
+    Default: lambda-get-ssmparam-policy
+  SsmTokenValueParam:
+    Type: String
+    Default: /stns/parameter/token
+  KmsKeyParam:
+    Type: String
+  RunTimeVersion:
+    Type: String
+    Default: python3.12
+
+  # ApiGateway name
+  ApiGatewayName:
+    Type: String
+    Default: stns-backend-api
+  AuthorizerName:
+    Type: String
+    Default: stns-token-authorizer
   StageName:
     Type: String
     Default: prod
     Description: Name of API stage.
 
-  LambdaFunctionName:
-    Type: String
-    Default: stns-auth
-
-  IAMRoleforLambda:
-    Type: String
-    Default: stns-auth-role
 
 Resources:
 # ------------------------------------------------------------#
@@ -26,7 +61,7 @@ Resources:
   StnsDynamoDBOSuserRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: stns-backend-iam-role
+      RoleName: !Ref IAMRoleName
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -39,7 +74,7 @@ Resources:
   StnsDynamoDBOSuserRolePolicy:
     Type: AWS::IAM::Policy
     Properties:
-      PolicyName: stns-backend-iam-policy
+      PolicyName: !Ref IAMPolicyName
       Roles: [ !Ref StnsDynamoDBOSuserRole ]  # Reference the role
       PolicyDocument:
         Version: '2012-10-17'
@@ -90,7 +125,7 @@ Resources:
   DynamoOsUserTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: stns-osuser
+      TableName: !Ref DynamoUserTablename
       AttributeDefinitions:
         - AttributeName: name
           AttributeType: S
@@ -112,7 +147,7 @@ Resources:
   DynamoOsGroupTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: stns-osgroup
+      TableName: !Ref DynamoGroupTablename
       AttributeDefinitions:
         - AttributeName: id
           AttributeType: S
@@ -124,6 +159,7 @@ Resources:
 # ------------------------------------------------------------#
 # Lambda
 # ------------------------------------------------------------#
+  # Execute Role
   FunctionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -147,24 +183,26 @@ Resources:
                   - 'logs:CreateLogStream'
                   - 'logs:PutLogEvents'
                 Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LambdaFunctionName}:*" 
-        - PolicyName: ssm-gettoken
+        - PolicyName: !Ref IAMPolicyforLambda
           PolicyDocument:
             Version: 2012-10-17
             Statement:
               - Effect: Allow
                 Action: 
                   - 'ssm:GetParameter'
-                Resource: "arn:aws:ssm:*:*:parameter/stns/parameter/token" 
+                Resource: !Sub "arn:aws:ssm:*:*:parameter${SsmTokenValueParam}" 
               - Effect: Allow
                 Action: 
                   - 'kms:Decrypt'
-                Resource: "arn:aws:kms:*:*:key/22f91baa-55bb-4ba9-99bb-a3927efecabd"
+                Resource: !Sub "arn:aws:kms:*:*:key/${KmsKeyParam}"
+  
+  # Lambda Function
   TargetFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Ref LambdaFunctionName
       Role: !GetAtt FunctionRole.Arn
-      Runtime: python3.12
+      Runtime: !Ref RunTimeVersion
       Handler: index.lambda_handler
       Code:
         ZipFile: !Sub |
@@ -182,7 +220,7 @@ Resources:
 
           def validate_token(token):
               try:
-                  parameter = ssm.get_parameter(Name='/stns/parameter/token', WithDecryption=True)
+                  parameter = ssm.get_parameter(Name='${SsmTokenValueParam}', WithDecryption=True)
                   stored_token = parameter['Parameter']['Value']
                   
                   return token == stored_token
@@ -215,16 +253,16 @@ Resources:
       - DynamoOsUserTable
       - TargetFunction
     Properties:
-      Name: stns-backend-api
+      Name: !Ref ApiGatewayName
       Description: stns backend api
-
+  
+  # Resources
   GroupsResource:
     Type: AWS::ApiGateway::Resource
     Properties:
       RestApiId: !Ref StnsBackendApi
       ParentId: !GetAtt StnsBackendApi.RootResourceId
       PathPart: "groups"
-
   UsersResource:
     Type: AWS::ApiGateway::Resource
     Properties:
@@ -236,7 +274,7 @@ Resources:
   TokenAuthorizer:
     Type: AWS::ApiGateway::Authorizer
     Properties:
-      Name: stns-token-authorizer
+      Name: !Ref AuthorizerName
       RestApiId: !Ref StnsBackendApi
       Type: TOKEN
       AuthorizerUri: !Sub 
@@ -245,7 +283,6 @@ Resources:
       IdentitySource: method.request.header.Authorization
       AuthorizerResultTtlInSeconds: 0
       IdentityValidationExpression: "^token (.*)$"
-
   LambdaPermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -254,6 +291,7 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${StnsBackendApi}/authorizers/${TokenAuthorizer}"
 
+  # GET method groups
   GetGroupsMethod:
     Type: AWS::ApiGateway::Method
     Properties:
@@ -355,6 +393,7 @@ Resources:
         - StatusCode: 404
         - StatusCode: 500
 
+  # GET method users
   GetUsersMethod:
     Type: AWS::ApiGateway::Method
     Properties:
