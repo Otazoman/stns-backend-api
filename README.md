@@ -1,4 +1,4 @@
-# stns-backend-apii  
+# stns-backend-api  
 AWS serverless stns backend  
 
 # Description  
