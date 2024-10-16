@@ -94,3 +94,54 @@ _EOS_
 
 $ sudo systemctl restart sshd.service
 ```
+
+# Setup stns-client for ubuntu24.04LTS
+1.Installing stns client and chache on Ubuntu24.04LTS  
+```
+$ sudo apt remove -y --purge ec2-instance-connect
+$ sudo shutdown -r now
+$ curl -fsSL https://repo.stns.jp/scripts/apt-repo.sh | sh
+$ sudo apt install -y libnss-stns-v2 cache-stnsd
+```
+2.stns client configuration file preparation  
+```
+$ SERVER=https://YOURAPIGATEWAY.execute-api.ap-northeast-1.amazonaws.com/prod/
+$ TOKEN=YOURTOKEN
+$ sudo tee -a /etc/stns/client/stns.conf <<_EOS_
+api_endpoint = "${SERVER}"
+auth_token = "${TOKEN}"
+
+[cached]
+enable = true
+_EOS_
+
+$ sudo systemctl restart cache-stnsd
+$ sudo systemctl enable cache-stnsd
+
+# test
+$ /usr/lib/stns/stns-key-wrapper YOURADDEDUSER
+```
+
+3.nsswitch configuration file modified  
+```
+$ sudo vi /etc/nsswitch.conf
+----------------------
+passwd:         files systemd  stns   # stns added
+group:          files systemd  stns   # stns added
+shadow:         files systemd  stns   # stns added
+gshadow:        files systemd
+----------------------
+```
+
+4.ssh configuration file modified  
+```
+$ sudo tee -a /etc/ssh/sshd_config <<_EOS_
+PubkeyAuthentication yes
+AuthorizedKeysCommand /usr/lib/stns/stns-key-wrapper
+AuthorizedKeysCommandUser root
+_EOS_
+$ sudo tee -a /etc/pam.d/sshd <<_EOS_
+session    required     pam_mkhomedir.so skel=/etc/skel/ umask=0022
+_EOS_
+$ sudo systemctl restart ssh.service
+```
